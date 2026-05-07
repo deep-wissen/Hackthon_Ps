@@ -1,0 +1,26 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: hacksys-backend
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  config: classpath:logback-spring.xml
+
+app:
+  inventory:
+    initial-stock: 50
+  payment:
+    timeout-ms: 3000
+  chaos:
+    intermittent-failure-rate: 0.25

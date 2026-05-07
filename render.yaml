@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: hacksys-backend
+    runtime: java
+    buildCommand: ./mvnw clean install -DskipTests
+    startCommand: java -jar target/backend-1.0.0.jar
+    envVars:
+      - key: JAVA_VERSION
+        value: 17

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+  <!-- In-memory log appender used by /logs API -->
+  <appender name="MEMORY" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>logs/app.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+      <fileNamePattern>logs/app.%d{yyyy-MM-dd}.log</fileNamePattern>
+      <maxHistory>7</maxHistory>
+    </rollingPolicy>
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <includeContext>false</includeContext>
+      <customFields>{"app":"hacksys-backend"}</customFields>
+      <fieldNames>
+        <timestamp>timestamp</timestamp>
+        <message>message</message>
+        <logger>class</logger>
+        <thread>thread</thread>
+        <level>level</level>
+      </fieldNames>
+      <includeMdcKeyName>trace_id</includeMdcKeyName>
+      <includeMdcKeyName>service</includeMdcKeyName>
+      <includeMdcKeyName>user_id</includeMdcKeyName>
+      <includeMdcKeyName>order_id</includeMdcKeyName>
+      <includeMdcKeyName>error_type</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  <!-- Console appender - structured JSON -->
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <includeContext>false</includeContext>
+      <customFields>{"app":"hacksys-backend"}</customFields>
+      <fieldNames>
+        <timestamp>timestamp</timestamp>
+        <message>message</message>
+        <logger>class</logger>
+        <thread>thread</thread>
+        <level>level</level>
+      </fieldNames>
+      <includeMdcKeyName>trace_id</includeMdcKeyName>
+      <includeMdcKeyName>service</includeMdcKeyName>
+      <includeMdcKeyName>user_id</includeMdcKeyName>
+      <includeMdcKeyName>order_id</includeMdcKeyName>
+      <includeMdcKeyName>error_type</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+    <appender-ref ref="MEMORY"/>
+  </root>
+
+</configuration>
