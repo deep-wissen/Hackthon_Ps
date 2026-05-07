@@ -1,0 +1,32 @@
+# Maven
+target/
+.mvn/
+mvnw
+mvnw.cmd
+
+# IDE
+.idea/
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+HELP.md
+
+# Render
+render.yaml
