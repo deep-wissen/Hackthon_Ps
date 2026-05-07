@@ -1,9 +1,7 @@
 services:
   - type: web
     name: hacksys-backend
-    runtime: java
-    buildCommand: ./mvnw clean install -DskipTests
-    startCommand: java -jar target/backend-1.0.0.jar
+    runtime: docker
     envVars:
-      - key: JAVA_VERSION
-        value: 17
+      - key: PORT
+        value: 8080
