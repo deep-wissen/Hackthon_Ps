@@ -62,14 +62,26 @@ public class LogStore {
 
     // Convenience shorthands used by services
     public void info(String service, String traceId, String message) {
-        append("INFO", service, traceId, null, message, null);
-    }
-
+    String caller = getCaller();
+    append("INFO", service, traceId, null, message, caller);
+}
     public void warn(String service, String traceId, String errorType, String message) {
-        append("WARN", service, traceId, errorType, message, null);
-    }
-
+    String caller = getCaller();
+    append("WARN", service, traceId, errorType, message, caller);
+}
     public void error(String service, String traceId, String errorType, String message) {
-        append("ERROR", service, traceId, errorType, message, null);
+    String caller = getCaller();
+    append("ERROR", service, traceId, errorType, message, caller);
+}
+
+    private String getCaller() {
+    StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+    for (StackTraceElement el : stack) {
+        String cls = el.getClassName();
+        if (!cls.contains("LogStore") && !cls.contains("Thread") && cls.contains("hacksys")) {
+            return cls.substring(cls.lastIndexOf('.') + 1);
+        }
     }
+    return "unknown";
+}
 }
