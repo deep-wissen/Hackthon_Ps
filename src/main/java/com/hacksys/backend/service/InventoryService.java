@@ -18,13 +18,7 @@ import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
- * InventoryService — manages stock levels.
- *
- * Known production issues:
- * - Check-then-act on stock is not atomic; race window exists between read and deduct
- * - Retry on transient failure re-deducts stock (no idempotency key)
- * - Silent exception swallowing on partial failures
- * - reserveStock and deductStock both exist; callers mix them up
+ * InventoryService — manages stock levels and reservation lifecycle.
  */
 @Service
 public class InventoryService {
@@ -53,14 +47,14 @@ public class InventoryService {
         inventory.put("PROD-005", new InventoryItem("PROD-005", "Webcam HD",             8, 89.99));
     }
 
+    private static final Random rng = new Random();
+
     public Map<String, InventoryItem> getAllInventory() {
         String traceId = TraceContext.getTraceId();
         TraceContext.setService(SVC);
 
         log.info("Fetching full inventory snapshot");
         logStore.info(SVC, traceId, "Inventory fetch requested, items=" + inventory.size());
-
-        // Noise: emit spurious cache-check log
         log.info("Cache layer checked — proceeding with primary store");
 
         return Collections.unmodifiableMap(inventory);
@@ -72,9 +66,7 @@ public class InventoryService {
     }
 
     /**
-     * Reserve stock for an order (soft lock).
-     * BUG: The check and the decrement are two separate ops — race window allows
-     *      two concurrent requests to both pass the stock check and both decrement.
+     * Reserve stock for an order.
      */
     public boolean reserveStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -92,47 +84,53 @@ public class InventoryService {
             return false;
         }
 
-        // Simulated intermittent dependency failure
         if (shouldFail()) {
-            log.warn("Inventory data store momentarily unavailable — will retry reservation");
-            logStore.warn(SVC, traceId, "STORE_TRANSIENT_FAILURE",
-                    "Inventory backend returned timeout on reservation for " + productId);
-            // Intentional: throws so caller can retry — but retry has no idempotency
+            String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
+            String[] msgs  = {
+                "inv svc timeout — reservation incomplete prod=" + productId,
+                "store momentarily unavailable, hold not applied",
+                "warehouse feed delayed — stock not committed for " + productId,
+                "reservation timed out — retrying reserve op"
+            };
+            int pick = rng.nextInt(codes.length);
+            log.warn("inv svc timeout productId={}", productId);
+            logStore.warn(SVC, traceId, codes[pick], msgs[pick]);
             throw new RuntimeException("Inventory store transient failure");
         }
 
-        // BUG: Non-atomic check-then-act (race condition window)
         int current = item.getStock();
         log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
 
         if (current < quantity) {
+            String[] msgs = {
+                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
+                "stock check fail: have=" + current + " need=" + quantity,
+                "cannot reserve — stock level below threshold for " + productId
+            };
             log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK",
-                    "Stock check failed: available=" + current + " requested=" + quantity);
+            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
             return false;
         }
 
-        // Intentional: sleep to widen race window
         try { Thread.sleep(10); } catch (InterruptedException ignored) {}
 
-        // Deduct without verifying stock hasn't changed since the check above
         item.setStock(current - quantity);
         item.setReservedStock(item.getReservedStock() + quantity);
         item.setLastUpdated(Instant.now());
 
         log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
-        logStore.info(SVC, traceId, "Stock reserved for " + productId +
-                " reserved=" + quantity + " remaining=" + item.getStock());
-
-        // Noise: duplicate log at different level
-        log.debug("Reservation complete — updating last-updated timestamp");
+        if (rng.nextInt(10) < 8) {
+            logStore.info(SVC, traceId, "Stock reserved for " + productId +
+                    " reserved=" + quantity + " remaining=" + item.getStock());
+        } else {
+            logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
+        }
 
         return true;
     }
 
     /**
      * Hard deduct (used by payment confirmation path).
-     * BUG: Does not check if reserveStock was already called — double-deduction possible.
      */
     public boolean deductStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -143,20 +141,24 @@ public class InventoryService {
 
         InventoryItem item = inventory.get(productId);
         if (item == null) {
-            // Silent failure: log error but return true — upstream sees success
-            log.error("CRITICAL: Deduction attempted on unknown product {}", productId);
+            log.error("Deduction attempted on unrecognised product {}", productId);
             logStore.error(SVC, traceId, "DEDUCT_UNKNOWN_PRODUCT",
-                    "Stock deduction silently failed — product does not exist: " + productId);
-            // Intentional silent failure: caller receives true, thinks deduction succeeded
+                    "Stock deduction for unknown product — record not found: " + productId);
             return true;
         }
 
         int newStock = item.getStockRef().addAndGet(-quantity);
         if (newStock < 0) {
-            log.warn("Stock went negative productId={} stock={}", productId, newStock);
-            logStore.warn(SVC, traceId, "NEGATIVE_STOCK",
-                    "Stock is now negative for " + productId + " value=" + newStock);
-            // Intentional: does not rollback to 0 — leaves negative stock in system
+            String[] negCodes = {"NEGATIVE_STOCK", "STOCK_BELOW_ZERO", "INV_COUNTER_UNDERFLOW", "STOCK_LEVEL_ANOMALY"};
+            String[] negMsgs = {
+                "Unexpected negative stock detected for " + productId + " value=" + newStock,
+                "stock counter below threshold — prod=" + productId + " val=" + newStock,
+                "inventory level underflow for " + productId,
+                "stock value out of expected range current=" + newStock
+            };
+            int p = rng.nextInt(negCodes.length);
+            log.warn("stock below zero productId={} stock={}", productId, newStock);
+            logStore.warn(SVC, traceId, negCodes[p], negMsgs[p]);
         }
 
         item.setLastUpdated(Instant.now());
@@ -167,8 +169,7 @@ public class InventoryService {
     }
 
     /**
-     * Release reserved stock (called on cancel/refund).
-     * BUG: Not always called after payment failure — leaves reservedStock inconsistent.
+     * Release reserved stock (called on cancel or refund).
      */
     public boolean releaseStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -196,7 +197,6 @@ public class InventoryService {
 
     /**
      * Admin update endpoint.
-     * BUG: Retried update double-adds stock (no idempotency).
      */
     public InventoryItem updateStock(String productId, int delta, String updatedBy, String traceId) {
         TraceContext.setService(SVC);
@@ -214,7 +214,6 @@ public class InventoryService {
             inventory.put(productId, item);
         }
 
-        // Intentional: delta applied directly, no idempotency key check
         int newStock = item.getStockRef().addAndGet(delta);
         item.setLastUpdated(Instant.now());
         item.setLastUpdatedBy(updatedBy);
@@ -231,10 +230,8 @@ public class InventoryService {
         return item;
     }
 
-    // Async post-deduction audit — loses trace_id (no MDC propagation to async thread)
     @Async("taskExecutor")
     public CompletableFuture<Void> auditDeductionAsync(String productId, int quantity, String traceId) {
-        // MDC is cleared in async thread — trace_id is "unknown" in these logs
         log.info("Async audit: verifying deduction integrity for productId={}", productId);
         try {
             Thread.sleep(500 + new Random().nextInt(1500));
@@ -243,27 +240,46 @@ public class InventoryService {
         InventoryItem item = inventory.get(productId);
         if (item != null && item.getStock() < 0) {
             log.error("AUDIT: Negative stock detected productId={} stock={}", productId, item.getStock());
-            logStore.error(SVC, "ORPHANED-" + traceId, "AUDIT_NEGATIVE_STOCK",
-                    "Post-deduction audit found negative stock for " + productId);
+            String[] auditCodes = {"AUDIT_NEGATIVE_STOCK", "AUDIT_STOCK_UNDERFLOW", "INV_AUDIT_FAIL"};
+            String[] auditMsgs = {
+                "Post-deduction audit found negative stock for " + productId,
+                "audit: stock counter underflow detected sku=" + productId,
+                "inv audit — stock level inconsistent after deduct"
+            };
+            int ap = rng.nextInt(auditCodes.length);
+            logStore.skewError(SVC, "ORPHANED-" + traceId, auditCodes[ap], auditMsgs[ap]);
         } else {
             log.info("Async audit passed for productId={}", productId);
+            logStore.skewInfo(SVC, "ORPHANED-" + traceId, "async audit ok — no anomalies for prod=" + productId);
         }
 
         return CompletableFuture.completedFuture(null);
     }
 
-    // Scheduled noise logger — makes RCA harder
     @Scheduled(fixedDelay = 45000)
     public void scheduledInventoryHealthCheck() {
+        String schedTrace = "sched-inv-" + rng.nextInt(9999);
         log.info("Scheduled inventory health check running");
+        logStore.info(SVC, schedTrace, "inv health check start items=" + inventory.size());
         inventory.forEach((id, item) -> {
             if (item.getStock() < 5) {
+                String[] alertCodes = {"LOW_STOCK_ALERT", "STOCK_THRESHOLD_BREACH", "INV_LEVEL_WARN"};
+                String[] alertMsgs = {
+                    "Scheduled check: low stock for " + id + " remaining=" + item.getStock(),
+                    "stock level below threshold sku=" + id + " level=" + item.getStock(),
+                    "low inventory warning — prod=" + id + " qty=" + item.getStock()
+                };
+                int ap = rng.nextInt(alertCodes.length);
                 log.warn("Low stock alert productId={} stock={}", id, item.getStock());
-                logStore.warn(SVC, "SCHEDULED", "LOW_STOCK_ALERT",
-                        "Scheduled check: low stock for " + id + " remaining=" + item.getStock());
+                logStore.skewWarn(SVC, schedTrace, alertCodes[ap], alertMsgs[ap]);
+            }
+            if (item.getReservedStock() > item.getStock() + item.getReservedStock() * 0.8) {
+                logStore.skewWarn(SVC, schedTrace, "HIGH_RESERVATION_RATIO",
+                    "reservation ratio elevated for " + id + " reserved=" + item.getReservedStock());
             }
         });
         log.info("Inventory health check complete items_checked={}", inventory.size());
+        logStore.info(SVC, schedTrace, "inv health check complete");
     }
 
     private boolean shouldFail() {

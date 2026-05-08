@@ -7,8 +7,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
@@ -23,14 +25,20 @@ public class LogStore {
     private static final Logger log = LoggerFactory.getLogger(LogStore.class);
     private static final int MAX_ENTRIES = 2000;
     private static final ObjectMapper mapper = new ObjectMapper();
+    private static final Random jitter = new Random();
 
-    // Static so it survives bean re-creation during context refresh
     private static final CopyOnWriteArrayList<ObjectNode> entries = new CopyOnWriteArrayList<>();
 
     public void append(String level, String service, String traceId,
                        String errorType, String message, String className) {
+        appendWithSkew(level, service, traceId, errorType, message, className, 0);
+    }
+
+    public void appendWithSkew(String level, String service, String traceId,
+                               String errorType, String message, String className, int skewMs) {
         ObjectNode node = mapper.createObjectNode();
-        node.put("timestamp", Instant.now().toString());
+        Instant ts = Instant.now().plusMillis(skewMs);
+        node.put("timestamp", ts.toString());
         node.put("trace_id", traceId != null ? traceId : "unknown");
         node.put("service", service != null ? service : "unknown");
         node.put("class", className != null ? className : "unknown");
@@ -40,7 +48,6 @@ public class LogStore {
 
         entries.add(node);
 
-        // Silently drop oldest logs when cap exceeded
         while (entries.size() > MAX_ENTRIES) {
             entries.remove(0);
         }
@@ -62,17 +69,34 @@ public class LogStore {
 
     // Convenience shorthands used by services
     public void info(String service, String traceId, String message) {
-    String caller = getCaller();
-    append("INFO", service, traceId, null, message, caller);
-}
+        String caller = getCaller();
+        append("INFO", service, traceId, null, message, caller);
+    }
     public void warn(String service, String traceId, String errorType, String message) {
-    String caller = getCaller();
-    append("WARN", service, traceId, errorType, message, caller);
-}
+        String caller = getCaller();
+        append("WARN", service, traceId, errorType, message, caller);
+    }
     public void error(String service, String traceId, String errorType, String message) {
-    String caller = getCaller();
-    append("ERROR", service, traceId, errorType, message, caller);
-}
+        String caller = getCaller();
+        append("ERROR", service, traceId, errorType, message, caller);
+    }
+
+    // Skewed shorthands — for async paths where clock drift is expected
+    public void skewInfo(String service, String traceId, String message) {
+        String caller = getCaller();
+        int skew = jitter.nextInt(501) - 250; // ±250ms
+        appendWithSkew("INFO", service, traceId, null, message, caller, skew);
+    }
+    public void skewWarn(String service, String traceId, String errorType, String message) {
+        String caller = getCaller();
+        int skew = jitter.nextInt(501) - 250;
+        appendWithSkew("WARN", service, traceId, errorType, message, caller, skew);
+    }
+    public void skewError(String service, String traceId, String errorType, String message) {
+        String caller = getCaller();
+        int skew = jitter.nextInt(501) - 250;
+        appendWithSkew("ERROR", service, traceId, errorType, message, caller, skew);
+    }
 
     private String getCaller() {
     StackTraceElement[] stack = Thread.currentThread().getStackTrace();

@@ -16,14 +16,7 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * PaymentService — handles payment processing and refunds.
- *
- * Known production issues:
- * - No idempotency key: repeated POST /pay creates duplicate payment records
- * - Payment processed even if order status is not RESERVED
- * - Async confirmation job loses MDC context (trace orphan)
- * - Partial write: payment record created but order not updated if thread is interrupted
- * - Refund can be issued multiple times (no status guard)
+ * PaymentService — handles payment processing and refund lifecycle.
  */
 @Service
 public class PaymentService {
@@ -40,9 +33,9 @@ public class PaymentService {
     @Value("${app.chaos.intermittent-failure-rate:0.25}")
     private double failureRate;
 
-    // All payments indexed by paymentId AND by orderId (intentional: multiple payments per order possible)
     private final ConcurrentHashMap<String, Payment> paymentsById    = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<Payment>> paymentsByOrder = new ConcurrentHashMap<>();
+    private static final Random rng = new Random();
 
     public PaymentService(LogStore logStore, OrderService orderService) {
         this.logStore = logStore;
@@ -51,9 +44,6 @@ public class PaymentService {
 
     /**
      * Process payment for an order.
-     * BUG 1: Does not validate order.status — payment succeeds even for CANCELLED orders.
-     * BUG 2: No idempotency — retried call creates a new payment record (duplicate charge).
-     * BUG 3: Partial write — payment created BEFORE order is updated. Thread interrupt → inconsistency.
      */
     public Payment processPayment(String orderId, String userId, double amount, String traceId) {
         TraceContext.setService(SVC);
@@ -63,13 +53,11 @@ public class PaymentService {
         log.info("Payment processing initiated orderId={} userId={} amount={}", orderId, userId, amount);
         logStore.info(SVC, traceId, "Payment initiated for orderId=" + orderId + " amount=" + amount);
 
-        // Null userId check — passes here because isEmpty catches null? No: null.isEmpty() NPEs
-        // But we check length, so null silently becomes "anonymous" at the wrong path
         String effectiveUserId = (userId != null && !userId.trim().isEmpty()) ? userId : "anonymous";
         if (!effectiveUserId.equals(userId)) {
-            log.warn("Payment initiated with null/empty userId — defaulting to anonymous");
+            log.warn("Payment initiated without valid userId — orderId={}", orderId);
             logStore.warn(SVC, traceId, "NULL_USER_ID",
-                    "userId was null or empty for orderId=" + orderId + " — proceeding as anonymous");
+                    "userId missing for orderId=" + orderId + " — proceeding as anonymous");
         }
 
         Order order = orderService.getOrder(orderId);
@@ -80,23 +68,33 @@ public class PaymentService {
             throw new IllegalArgumentException("Order not found: " + orderId);
         }
 
-        // BUG: Status check logs warning but does NOT block payment for CREATED orders
         if (order.getStatus() != Order.Status.RESERVED && order.getStatus() != Order.Status.CREATED) {
-            log.warn("Payment for non-standard order state orderId={} status={}",
+            String[] warnCodes = {"UNEXPECTED_ORDER_STATUS", "ORDER_STATE_MISMATCH", "AUTH_ON_TERMINAL_ORDER"};
+            String[] warnMsgs = {
+                "payment auth continuing despite terminal order state",
+                "order state mismatch during auth phase — status=" + order.getStatus(),
+                "retry auth accepted — order not in payable state orderId=" + orderId,
+                "Payment proceeding for order status=" + order.getStatus() + " orderId=" + orderId
+            };
+            log.warn("Payment initiated for order in non-standard state orderId={} status={}",
                     orderId, order.getStatus());
-            logStore.warn(SVC, traceId, "UNEXPECTED_ORDER_STATUS",
-                    "Payment proceeding despite order status=" + order.getStatus());
+            logStore.warn(SVC, traceId, warnCodes[rng.nextInt(warnCodes.length)],
+                    warnMsgs[rng.nextInt(warnMsgs.length)]);
         }
 
-        // Noise log
         log.info("Routing payment through primary processor gateway");
 
-        // Simulated intermittent gateway failure
         if (shouldFail()) {
-            log.warn("Payment gateway timeout — request will be retried by client");
-            logStore.warn(SVC, traceId, "GATEWAY_TIMEOUT",
-                    "Payment gateway did not respond within SLA for orderId=" + orderId);
-            // Intentional: throw RuntimeException — client retries and creates duplicate payment
+            String[] gwCodes = {"GTWY_TMO", "GATEWAY_TIMEOUT", "PAY_GATEWAY_ERR", "PAYMENT_SVC_TIMEOUT"};
+            String[] gwMsgs  = {
+                "payment gateway did not respond within SLA orderId=" + orderId,
+                "gateway timeout — orderId=" + orderId,
+                "pay svc unreachable — request not processed",
+                "upstream gateway timeout on auth attempt"
+            };
+            int g = rng.nextInt(gwCodes.length);
+            log.warn("Payment gateway timeout — orderId={}", orderId);
+            logStore.warn(SVC, traceId, gwCodes[g], gwMsgs[g]);
             throw new RuntimeException("Payment gateway timeout");
         }
 
@@ -107,10 +105,9 @@ public class PaymentService {
             log.info("Payment processor responded in {}ms", processingTime);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            log.error("Payment processing interrupted — partial write risk", e);
+            log.error("Payment processing interrupted orderId={}", orderId, e);
             logStore.error(SVC, traceId, "PROCESSING_INTERRUPTED",
                     "Thread interrupted during payment for orderId=" + orderId);
-            // Intentional: throw after logging — but payment record was NOT yet created
         }
 
         // Create payment record
@@ -118,27 +115,29 @@ public class PaymentService {
         Payment payment = new Payment(paymentId, orderId, effectiveUserId, amount);
         payment.setStatus(Payment.Status.SUCCESS);
 
-        // PARTIAL WRITE WINDOW: payment stored but order not yet updated
         paymentsById.put(paymentId, payment);
         paymentsByOrder.computeIfAbsent(orderId, k -> new CopyOnWriteArrayList<>()).add(payment);
 
         log.info("Payment record created paymentId={} orderId={}", paymentId, orderId);
         logStore.info(SVC, traceId, "Payment record persisted paymentId=" + paymentId);
 
-        // Intentional delay between payment write and order update (widens partial write window)
         try { Thread.sleep(50); } catch (InterruptedException ignored) {}
 
-        // Update order — this can fail after payment is already recorded
         boolean orderUpdated = orderService.markOrderPaid(orderId, paymentId, traceId);
         if (!orderUpdated) {
-            log.error("Payment succeeded but order status update FAILED orderId={} paymentId={}",
+            String[] pCodes = {"ORDER_UPDATE_FAILURE", "PAY_PARTIAL_WRITE", "ORDER_SYNC_FAILURE", "PARTIAL_COMMIT"};
+            String[] pMsgs  = {
+                "Payment=" + paymentId + " persisted but orderId=" + orderId + " not updated to PAID",
+                "partial write — payment committed but order state not synced",
+                "order sync failed post-payment — orderId=" + orderId,
+                "pay record created, order update skipped — paymentId=" + paymentId
+            };
+            int pp = rng.nextInt(pCodes.length);
+            log.error("Payment recorded but order status update failed orderId={} paymentId={}",
                     orderId, paymentId);
-            logStore.error(SVC, traceId, "ORDER_UPDATE_FAILURE",
-                    "Payment=" + paymentId + " recorded but order=" + orderId + " not updated to PAID");
-            // Intentional: does NOT rollback the payment — orphaned payment in the store
+            logStore.error(SVC, traceId, pCodes[pp], pMsgs[pp]);
         }
 
-        // Async post-processing (loses trace context — MDC not propagated)
         schedulePaymentConfirmation(paymentId, orderId, traceId);
 
         log.info("Payment completed successfully paymentId={}", paymentId);
@@ -149,7 +148,6 @@ public class PaymentService {
 
     /**
      * Refund a payment.
-     * BUG: No guard against multiple refunds — calling twice refunds twice.
      */
     public Payment refundPayment(String orderId, String traceId) {
         TraceContext.setService(SVC);
@@ -166,14 +164,18 @@ public class PaymentService {
             throw new IllegalStateException("No payment found for order: " + orderId);
         }
 
-        // Intentional: refunds the LATEST payment, ignoring whether it was already refunded
         Payment latest = payments.get(payments.size() - 1);
 
         if (latest.getStatus() == Payment.Status.REFUNDED) {
-            log.warn("Duplicate refund attempt on already-refunded payment paymentId={}", latest.getId());
-            logStore.warn(SVC, traceId, "DUPLICATE_REFUND",
-                    "Refund issued on already-refunded paymentId=" + latest.getId());
-            // Intentional: proceeds anyway — double refund
+            String[] dupCodes = {"DUPLICATE_REFUND", "REFUND_ALREADY_PROCESSED", "WARN_DUP_REFUND"};
+            String[] dupMsgs  = {
+                "Refund attempt on already-refunded paymentId=" + latest.getId(),
+                "duplicate refund — payment already in REFUNDED state",
+                "refund re-issued for paymentId=" + latest.getId() + " — state not checked"
+            };
+            int dr = rng.nextInt(dupCodes.length);
+            log.warn("Refund requested on payment already in REFUNDED state paymentId={}", latest.getId());
+            logStore.warn(SVC, traceId, dupCodes[dr], dupMsgs[dr]);
         }
 
         latest.setStatus(Payment.Status.REFUNDED);
@@ -193,10 +195,8 @@ public class PaymentService {
         return paymentsById.get(paymentId);
     }
 
-    // Async confirmation — runs in hacksys-async thread, MDC is cleared
     @Async("taskExecutor")
     public CompletableFuture<Void> schedulePaymentConfirmation(String paymentId, String orderId, String callerTraceId) {
-        // MDC empty in this thread — logs appear with no trace_id
         try {
             Thread.sleep(1000 + new Random().nextInt(2000));
         } catch (InterruptedException ignored) {}
@@ -211,13 +211,18 @@ public class PaymentService {
 
         // Simulate occasional async confirmation failure
         if (Math.random() < 0.15) {
+            String[] cfailCodes = {"CONFIRM_NOTIFICATION_FAILED", "PAY_CONFIRM_ERR", "ASYNC_CONFIRM_TIMEOUT"};
+            String[] cfailMsgs  = {
+                "Payment confirmation notification failed for paymentId=" + paymentId,
+                "async confirm timed out — notification not dispatched",
+                "confirmation svc did not ack — paymentId=" + paymentId + " orderId=" + orderId
+            };
+            int cf = rng.nextInt(cfailCodes.length);
             log.warn("Async payment confirmation failed — notification not sent paymentId={}", paymentId);
-            logStore.warn(SVC, "ASYNC-ORPHAN", "CONFIRM_NOTIFICATION_FAILED",
-                    "Payment confirmation notification failed for paymentId=" + paymentId +
-                    " orderId=" + orderId + " (trace context lost in async thread)");
+            logStore.skewWarn(SVC, "ASYNC-ORPHAN", cfailCodes[cf], cfailMsgs[cf]);
         } else {
             log.info("Async confirmation sent paymentId={}", paymentId);
-            logStore.info(SVC, "ASYNC-" + callerTraceId,
+            logStore.skewInfo(SVC, "ASYNC-" + callerTraceId,
                     "Payment confirmation dispatched for paymentId=" + paymentId);
         }
 

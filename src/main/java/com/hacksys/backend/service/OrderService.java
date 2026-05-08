@@ -16,14 +16,7 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * OrderService — manages order lifecycle.
- *
- * Known production issues:
- * - createOrder does not validate all item fields (null productId passes through)
- * - Inventory reservation happens AFTER order is persisted (state transition violation)
- * - markOrderPaid can race with cancel — order ends up PAID after CANCELLED
- * - cancelOrder does not release reserved inventory in all paths
- * - Delayed post-creation job fires errors that don't match the original request trace
+ * OrderService — manages order lifecycle including creation, reservation, payment and cancellation.
  */
 @Service
 public class OrderService {
@@ -38,6 +31,7 @@ public class OrderService {
     private double failureRate;
 
     private final ConcurrentHashMap<String, Order> orders = new ConcurrentHashMap<>();
+    private static final Random rng = new Random();
 
     // Setter injection to break circular dependency with PaymentService
     public void setInventoryService(InventoryService inventoryService) {
@@ -49,10 +43,7 @@ public class OrderService {
     }
 
     /**
-     * Create a new order.
-     * BUG 1: Items with null productId pass initial validation — fail later in inventory.
-     * BUG 2: Order saved to store BEFORE inventory is reserved (state transition violation).
-     * BUG 3: On inventory failure, order remains CREATED (not FAILED) in 30% of paths.
+     * Create a new order and attempt inventory reservation.
      */
     public Order createOrder(String userId, List<Order.OrderItem> items, String traceId) {
         TraceContext.setService(SVC);
@@ -62,44 +53,41 @@ public class OrderService {
         log.info("Order creation requested userId={} itemCount={}", userId, items != null ? items.size() : 0);
         logStore.info(SVC, traceId, "New order request from userId=" + userId +
                 " items=" + (items != null ? items.size() : "null"));
-
-        // Weak validation: checks list is not null/empty but not individual item validity
         if (items == null || items.isEmpty()) {
             log.error("Order rejected — no items provided userId={}", userId);
             logStore.error(SVC, traceId, "EMPTY_ORDER", "Order rejected: no items for userId=" + userId);
             throw new IllegalArgumentException("Order must contain at least one item");
         }
 
-        // Intentional: userId null passes here; NPE occurs later in downstream userId.toUpperCase() calls
         if (userId == null) {
             log.warn("Order submitted with null userId — continuing without user association");
             logStore.warn(SVC, traceId, "NULL_USER_ID",
-                    "Order created with null userId — may cause downstream failures");
+                    "Order submitted without user context — downstream association unavailable");
         }
-
-        // Noise: duplicate validation log
         log.info("Item validation passed — {} items in order", items.size());
 
         String orderId = UUID.randomUUID().toString();
         Order order = new Order(orderId, userId, items);
         order.setStatus(Order.Status.CREATED);
 
-        // BUG: Order is persisted BEFORE inventory is reserved
         orders.put(orderId, order);
         TraceContext.setOrderId(orderId);
 
         log.info("Order persisted orderId={} status=CREATED", orderId);
         logStore.info(SVC, traceId, "Order record created orderId=" + orderId + " status=CREATED");
 
-        // Simulated intermittent failure before inventory reservation
         if (shouldFail()) {
+            String[] rCodes = {"RESERVATION_PHASE_FAILURE", "INV_HOLD_TIMEOUT", "ORDER_PHASE_ABORT"};
+            String[] rMsgs = {
+                "Transient failure during inventory phase for orderId=" + orderId,
+                "inv hold phase did not complete — orderId=" + orderId,
+                "order pipeline aborted at reservation stage"
+            };
+            int rp = rng.nextInt(rCodes.length);
             log.warn("Order service experienced internal hiccup during inventory reservation phase");
-            logStore.warn(SVC, traceId, "RESERVATION_PHASE_FAILURE",
-                    "Transient failure during inventory phase for orderId=" + orderId);
-            // Intentional: order stays CREATED but inventory is never reserved
-            // Async job below will fire warnings that seem unrelated
+            logStore.warn(SVC, traceId, rCodes[rp], rMsgs[rp]);
             schedulePostCreationAudit(orderId, traceId);
-            return order; // Returns with status=CREATED, no inventory reserved
+            return order;
         }
 
         // Attempt inventory reservation for each item
@@ -107,7 +95,6 @@ public class OrderService {
         for (Order.OrderItem item : items) {
             try {
                 boolean reserved = false;
-                // Null productId — will throw NPE inside inventoryService.reserveStock
                 if (item.getProductId() == null) {
                     log.warn("Item with null productId encountered in order orderId={}", orderId);
                     logStore.warn(SVC, traceId, "NULL_PRODUCT_ID",
@@ -125,11 +112,16 @@ public class OrderService {
                 }
             } catch (RuntimeException e) {
                 allReserved = false;
+                String pid = item.getProductId();
                 log.error("Exception during inventory reservation productId={} orderId={} error={}",
-                        item.getProductId(), orderId, e.getMessage());
-                logStore.error(SVC, traceId, "RESERVATION_EXCEPTION",
-                        "Reservation threw exception for productId=" + item.getProductId() +
-                        " orderId=" + orderId + ": " + e.getMessage());
+                        pid, orderId, e.getMessage());
+                String[] exCodes = {"RESERVATION_EXCEPTION", "INV_RESERVE_ERR", "STOCK_HOLD_FAILED"};
+                String[] exMsgs  = {
+                    "Reservation threw exception for productId=" + pid + " orderId=" + orderId,
+                    "inv reserve failed — " + e.getMessage(),
+                    "stock hold not applied for orderId=" + orderId + (pid != null ? " sku=" + pid : "")
+                };
+                logStore.error(SVC, traceId, exCodes[rng.nextInt(exCodes.length)], exMsgs[rng.nextInt(exMsgs.length)]);
             }
         }
 
@@ -138,17 +130,22 @@ public class OrderService {
             log.info("All items reserved orderId={} status=RESERVED", orderId);
             logStore.info(SVC, traceId, "Order fully reserved orderId=" + orderId);
         } else {
-            // Intentional: sometimes marks FAILED, sometimes leaves as CREATED
             if (Math.random() > 0.3) {
                 order.setStatus(Order.Status.FAILED);
                 log.error("Order failed — partial or no inventory reservation orderId={}", orderId);
                 logStore.error(SVC, traceId, "PARTIAL_RESERVATION",
                         "Order marked FAILED due to reservation issues orderId=" + orderId);
             } else {
-                log.warn("Some items not reserved — order remains CREATED (may proceed to payment)");
-                logStore.warn(SVC, traceId, "INCONSISTENT_STATE",
-                        "Order left in CREATED state despite reservation failure orderId=" + orderId);
-                // Intentional: order in CREATED state can still be paid
+                String[] iCodes = {"INCONSISTENT_STATE", "ORDER_UNCOMMITTED", "STATE_UNRESOLVED", "RESERVATION_INCOMPLETE"};
+                String[] iMsgs  = {
+                    "Order state unresolved post-reservation orderId=" + orderId,
+                    "order committed but inv hold incomplete — may proceed to payment",
+                    "reservation not finalised — order in indeterminate state",
+                    "state transition not completed — orderId=" + orderId + " remains uncommitted"
+                };
+                int ii = rng.nextInt(iCodes.length);
+                log.warn("Reservation incomplete — order state not updated orderId={}", orderId);
+                logStore.warn(SVC, traceId, iCodes[ii], iMsgs[ii]);
             }
         }
 
@@ -176,7 +173,6 @@ public class OrderService {
 
     /**
      * Mark order as paid.
-     * BUG: Can race with cancel — CANCELLED → PAID transition is not guarded.
      */
     public boolean markOrderPaid(String orderId, String paymentId, String traceId) {
         TraceContext.setService(SVC);
@@ -192,18 +188,22 @@ public class OrderService {
             return false;
         }
 
-        // BUG: No CAS — check-then-set is racy; can set PAID after CANCELLED
         if (order.getStatus() == Order.Status.CANCELLED) {
-            log.warn("Marking CANCELLED order as PAID orderId={}", orderId);
-            logStore.warn(SVC, traceId, "PAID_AFTER_CANCEL",
-                    "State machine violation: order was CANCELLED but now being marked PAID orderId=" + orderId);
+            String[] smCodes = {"PAID_AFTER_CANCEL", "STATE_MACHINE_VIOLATION", "ORDER_STATE_CONFLICT"};
+            String[] smMsgs  = {
+                "Payment accepted while order in terminal state orderId=" + orderId,
+                "state transition conflict — order marked paid from cancelled state",
+                "order state mismatch — payment applied to non-payable order orderId=" + orderId
+            };
+            int sm = rng.nextInt(smCodes.length);
+            log.warn("Payment accepted while order in terminal state orderId={}", orderId);
+            logStore.warn(SVC, traceId, smCodes[sm], smMsgs[sm]);
         }
 
-        // Simulated occasional failure to update order (partial write)
         if (Math.random() < 0.1) {
             log.error("Database write failure updating order status orderId={}", orderId);
             logStore.error(SVC, traceId, "DB_WRITE_FAILURE",
-                    "Order status update failed — orderId=" + orderId + " not marked PAID (payment succeeded)");
+                    "Order status update failed — orderId=" + orderId + " write did not complete");
             return false;
         }
 
@@ -218,8 +218,7 @@ public class OrderService {
     }
 
     /**
-     * Cancel an order.
-     * BUG: Does not always release reserved inventory — orphaned reservations.
+     * Cancel an order and release reserved inventory.
      */
     public Order cancelOrder(String orderId, String traceId) {
         TraceContext.setService(SVC);
@@ -244,7 +243,6 @@ public class OrderService {
 
         order.setStatus(Order.Status.CANCELLED);
 
-        // BUG: Inventory release skipped ~40% of the time due to intermittent "service call" failure
         if (Math.random() > 0.6 && inventoryService != null) {
             for (Order.OrderItem item : order.getItems()) {
                 try {
@@ -254,13 +252,20 @@ public class OrderService {
                             item.getProductId(), orderId, e.getMessage());
                     logStore.error(SVC, traceId, "INVENTORY_RELEASE_FAILED",
                             "Stock release failed for productId=" + item.getProductId() +
-                            " during cancel of orderId=" + orderId);
+                            " orderId=" + orderId);
                 }
             }
         } else {
-            log.info("Inventory release skipped — marking as deferred");
-            logStore.warn(SVC, traceId, "INVENTORY_RELEASE_DEFERRED",
-                    "Inventory not released on cancel for orderId=" + orderId + " — stock may remain reserved");
+            String[] dCodes = {"INVENTORY_RELEASE_DEFERRED", "INV_HOLD_OUTSTANDING", "STOCK_NOT_RELEASED", "RELEASE_DEFERRED"};
+            String[] dMsgs  = {
+                "Stock release deferred for orderId=" + orderId + " — stock may remain uncommitted",
+                "inv hold outstanding after void — orderId=" + orderId,
+                "stock not released on cancel — reservation may persist",
+                "release deferred — stock hold not cleared for orderId=" + orderId
+            };
+            int di = rng.nextInt(dCodes.length);
+            log.info("Inventory release deferred — orderId={}", orderId);
+            logStore.warn(SVC, traceId, dCodes[di], dMsgs[di]);
         }
 
         log.info("Order cancelled orderId={}", orderId);
@@ -278,14 +283,13 @@ public class OrderService {
         }
     }
 
-    // Async audit job — MDC is NOT propagated, so logs appear with no trace
     @Async("taskExecutor")
     public CompletableFuture<Void> schedulePostCreationAudit(String orderId, String callerTraceId) {
         try {
             Thread.sleep(2000 + new Random().nextInt(3000));
         } catch (InterruptedException ignored) {}
 
-        // No MDC in this thread
+
         Order order = orders.get(orderId);
         if (order == null) {
             log.error("Async audit: order vanished orderId={}", orderId);
@@ -295,18 +299,23 @@ public class OrderService {
         }
 
         if (order.getStatus() == Order.Status.CREATED) {
+            String[] stCodes = {"ORDER_STUCK_CREATED", "ORDER_PIPELINE_STALL", "CREATED_STATE_TIMEOUT"};
+            String[] stMsgs  = {
+                "Order still in CREATED state post-audit — possible reservation failure orderId=" + orderId,
+                "order pipeline stall — no state transition after creation window",
+                "orderId=" + orderId + " stuck in CREATED — inv phase may not have completed"
+            };
+            int st = rng.nextInt(stCodes.length);
             log.warn("Async audit: order stuck in CREATED state after creation window orderId={}", orderId);
-            logStore.warn(SVC, "ASYNC-" + callerTraceId, "ORDER_STUCK_CREATED",
-                    "Order still in CREATED state post-audit — possible reservation failure orderId=" + orderId);
+            logStore.skewWarn(SVC, "ASYNC-" + callerTraceId, stCodes[st], stMsgs[st]);
         }
 
         if (order.getStatus() == Order.Status.RESERVED && order.getPaymentId() == null) {
             log.info("Async audit: order reserved but unpaid, eligible for payment orderId={}", orderId);
-            logStore.info(SVC, "ASYNC-" + callerTraceId,
+            logStore.skewInfo(SVC, "ASYNC-" + callerTraceId,
                     "Audit pass: reserved order awaiting payment orderId=" + orderId);
         }
 
-        // Noise: always emit this misleading "reconciliation" log
         log.info("Order reconciliation check complete orderId={}", orderId);
 
         return CompletableFuture.completedFuture(null);

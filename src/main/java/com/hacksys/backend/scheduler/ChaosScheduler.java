@@ -11,18 +11,21 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 public class ChaosScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(ChaosScheduler.class);
-    private static final String SVC = "ChaosScheduler";
+    private static final String SVC = "BackgroundWorker";
 
     private final LogStore logStore;
     private final OrderService orderService;
     private final PaymentService paymentService;
     private final InventoryService inventoryService;
     private final Random random = new Random();
+
+    private final ConcurrentHashMap<String, Long> pendingReconciliation = new ConcurrentHashMap<>();
 
     private static final String[] USER_IDS = {
         "user-101", "user-202", "user-303", "user-404", "user-505"
@@ -39,146 +42,387 @@ public class ChaosScheduler {
         this.inventoryService = inventoryService;
     }
 
+    // Reconciliation worker — processes pending orders and retries failed transitions
     @Scheduled(fixedDelay = 30000, initialDelay = 5000)
-    public void simulateOrderFlow() {
-        String traceId = "chaos-" + UUID.randomUUID().toString().substring(0, 8);
+    public void reconciliationWorker() {
+        String traceId = "recon-" + UUID.randomUUID().toString().substring(0, 8);
         String userId = USER_IDS[random.nextInt(USER_IDS.length)];
         String productId = PRODUCT_IDS[random.nextInt(PRODUCT_IDS.length)];
         int quantity = 1 + random.nextInt(5);
 
-        logStore.info(SVC, traceId, "Chaos: starting simulated order flow for userId=" + userId);
+        logStore.info(SVC, traceId, "reconciliation cycle start userId=" + userId);
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem(productId, quantity, 79.99));
             Order order = orderService.createOrder(userId, items, traceId);
+            pendingReconciliation.put(order.getId(), System.currentTimeMillis());
 
             if (random.nextDouble() < 0.3) {
                 try {
                     paymentService.processPayment(order.getId(), userId, quantity * 79.99, traceId);
                 } catch (RuntimeException e) {
-                    logStore.error(SVC, traceId, "CHAOS_PAYMENT_FAILED",
-                        "Chaos: payment failed for orderId=" + order.getId() + " reason=" + e.getMessage());
+                    String[] eCodes = {"PAYMENT_PROCESSING_ERROR", "RECON_PAY_FAIL", "PAY_CYCLE_ERR"};
+                    logStore.error(SVC, traceId, eCodes[random.nextInt(eCodes.length)],
+                        "payment processing failed orderId=" + order.getId() + " msg=" + e.getMessage());
                 }
             }
 
             if (random.nextDouble() < 0.2) {
                 try {
                     orderService.cancelOrder(order.getId(), traceId);
-                    logStore.warn(SVC, traceId, "CHAOS_CANCEL_AFTER_CREATE",
-                        "Chaos: order cancelled shortly after creation orderId=" + order.getId());
+                    logStore.warn(SVC, traceId, "ORDER_CANCELLED_EARLY",
+                        "order voided during reconciliation window orderId=" + order.getId());
                 } catch (Exception e) {
-                    logStore.error(SVC, traceId, "CHAOS_CANCEL_FAILED",
-                        "Chaos: cancellation threw exception orderId=" + order.getId());
+                    logStore.error(SVC, traceId, "CANCEL_ERROR",
+                        "cancellation error during reconciliation orderId=" + order.getId());
                 }
             }
         } catch (RuntimeException e) {
-            logStore.error(SVC, traceId, "CHAOS_ORDER_FLOW_FAILED",
-                "Chaos order flow failed: " + e.getMessage());
+            logStore.error(SVC, traceId, "RECONCILIATION_CYCLE_FAILED",
+                "reconciliation cycle encountered unrecoverable error: " + e.getMessage());
         }
+        logStore.info(SVC, traceId, "reconciliation cycle end");
     }
 
+    // Retry processor — replays failed order submissions from upstream dead-letter queue
     @Scheduled(fixedDelay = 45000, initialDelay = 12000)
-    public void simulateNullUserIdBug() {
-        String traceId = "chaos-null-" + UUID.randomUUID().toString().substring(0, 8);
-        logStore.warn(SVC, traceId, "NULL_USER_SCENARIO",
-            "Chaos: simulating order with null userId — expect NPE downstream");
+    public void retryProcessorWorker() {
+        String traceId = "retry-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "retry processor: dequeuing failed submissions batch_size=1");
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-001", 1, 79.99));
             orderService.createOrder(null, items, traceId);
+            logStore.info(SVC, traceId, "retry processor: submission accepted");
         } catch (Exception e) {
-            logStore.error(SVC, traceId, "NULL_POINTER_EXCEPTION",
-                "Chaos: NullPointerException triggered by null userId — class=OrderService method=createOrder");
+            logStore.error(SVC, traceId, "RETRY_SUBMISSION_ERROR",
+                "retry processor: submission rejected after requeue — skipping record");
         }
     }
 
+    // Payment poller — polls PAYMENT_PENDING queue and enforces state transitions
     @Scheduled(fixedDelay = 60000, initialDelay = 20000)
-    public void simulateStateMachineBug() {
-        String traceId = "chaos-state-" + UUID.randomUUID().toString().substring(0, 8);
-        logStore.warn(SVC, traceId, "STATE_MACHINE_SCENARIO",
-            "Chaos: simulating payment on a CANCELLED order — state machine violation expected");
+    public void paymentPollerWorker() {
+        String traceId = "pay-poll-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "payment poller: scanning pending payment queue");
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-002", 1, 129.99));
-            Order order = orderService.createOrder("user-chaos", items, traceId);
+            Order order = orderService.createOrder("user-poll", items, traceId);
             orderService.cancelOrder(order.getId(), traceId);
+            logStore.info(SVC, traceId, "payment poller: processing queued payment orderId=" + order.getId());
             try {
-                paymentService.processPayment(order.getId(), "user-chaos", 129.99, traceId);
-                logStore.error(SVC, traceId, "PAYMENT_ON_CANCELLED_ORDER",
-                    "CRITICAL: Payment accepted for CANCELLED order! orderId=" + order.getId() +
-                    " — state machine violation, payment should have been rejected.");
+                paymentService.processPayment(order.getId(), "user-poll", 129.99, traceId);
+                // Cross-service terminology: BackgroundWorker describes the same inv issue differently
+                logStore.warn(SVC, traceId, "UNEXPECTED_PAYMENT_STATE",
+                    "stock commit not finalized — payment accepted for order in non-payable state orderId=" + order.getId());
+                String fulfillTraceId = "fulfill-" + traceId.substring(traceId.length() - 4);
+                logStore.warn(SVC, fulfillTraceId, "FULFILLMENT_DISPATCH_ANOMALY",
+                    "fulfillment dispatch initiated — order state inconsistent orderId=" + order.getId());
             } catch (RuntimeException e) {
-                logStore.warn(SVC, traceId, "PAYMENT_GATEWAY_TIMEOUT",
-                    "Chaos: gateway timeout during payment on cancelled order: " + e.getMessage());
+                String[] gwMsgs = {"gateway retry #1 orderId=" + order.getId(), "pay svc timeout — will retry", "upstream unavailable — orderId=" + order.getId()};
+                logStore.warn(SVC, traceId, "PAYMENT_GATEWAY_UNAVAILABLE", gwMsgs[random.nextInt(gwMsgs.length)]);
             }
         } catch (Exception e) {
-            logStore.error(SVC, traceId, "CHAOS_STATE_MACHINE_ERROR",
-                "Chaos state machine scenario threw: " + e.getMessage());
+            logStore.error(SVC, traceId, "PAYMENT_POLLER_ERROR",
+                "payment poller: unhandled exception — " + e.getMessage());
         }
+        logStore.info(SVC, traceId, "payment poller: scan complete");
     }
 
+    // Nightly stock sync — reconciles warehouse stock feed with internal inventory
     @Scheduled(fixedDelay = 50000, initialDelay = 8000)
-    public void simulateNegativeInventoryBug() {
-        String traceId = "chaos-inv-" + UUID.randomUUID().toString().substring(0, 8);
-        logStore.warn(SVC, traceId, "NEGATIVE_STOCK_SCENARIO",
-            "Chaos: deducting large quantity to force negative stock — boundary error expected");
+    public void nightlyStockSyncWorker() {
+        String traceId = "stock-sync-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "stock sync: applying delta from warehouse feed product=PROD-005");
         try {
             inventoryService.deductStock("PROD-005", 999, traceId);
-            logStore.error(SVC, traceId, "NEGATIVE_STOCK_DETECTED",
-                "Chaos: stock for PROD-005 is now negative! Root cause: deductStock() does not validate quantity before deducting.");
+            // Cross-service terminology: BackgroundWorker uses "stock commit not finalized" for same inv issue
+            String[] anomalyMsgs = {
+                "Unexpected negative stock value detected for PROD-005 — warehouse delta may be stale",
+                "stock commit not finalized — inv counter below zero for PROD-005",
+                "warehouse sync produced out-of-range stock level for PROD-005"
+            };
+            logStore.warn(SVC, traceId, "STOCK_LEVEL_ANOMALY", anomalyMsgs[random.nextInt(anomalyMsgs.length)]);
         } catch (Exception e) {
-            logStore.error(SVC, traceId, "CHAOS_INVENTORY_ERROR",
-                "Chaos inventory scenario threw: " + e.getMessage());
+            logStore.error(SVC, traceId, "STOCK_SYNC_ERROR",
+                "stock sync: error applying warehouse delta — " + e.getMessage());
         }
+        logStore.info(SVC, traceId, "stock sync: feed application complete");
     }
 
+    // Payment retry worker — retries failed payment authorisations for pending orders
     @Scheduled(fixedDelay = 40000, initialDelay = 15000)
-    public void simulateDuplicatePaymentBug() {
-        String traceId = "chaos-dup-" + UUID.randomUUID().toString().substring(0, 8);
-        logStore.warn(SVC, traceId, "DUPLICATE_PAYMENT_SCENARIO",
-            "Chaos: retrying payment for same order — duplicate charge expected");
+    public void paymentRetryWorker() {
+        String traceId = "pay-retry-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "payment retry worker: beginning retry sweep");
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-003", 2, 39.99));
             Order order = orderService.createOrder("user-retry", items, traceId);
+            logStore.info(SVC, traceId, "payment retry worker: retrying authorization orderId=" + order.getId() + " attempt=1");
             for (int attempt = 1; attempt <= 2; attempt++) {
                 try {
                     paymentService.processPayment(order.getId(), "user-retry", 79.98, traceId);
                     if (attempt == 2) {
-                        logStore.error(SVC, traceId, "DUPLICATE_CHARGE",
-                            "Chaos: DUPLICATE PAYMENT PROCESSED for orderId=" + order.getId() +
-                            " attempt=" + attempt + " — no idempotency key in PaymentService!");
+                        String[] dupMsgs = {
+                            "Duplicate payment record created for orderId=" + order.getId() + " retry attempt=" + attempt,
+                            "auth retry collision — second payment record persisted orderId=" + order.getId(),
+                            "pay record conflict detected on retry orderId=" + order.getId()
+                        };
+                        logStore.warn(SVC, traceId, "DUPLICATE_PAYMENT_RECORD", dupMsgs[random.nextInt(dupMsgs.length)]);
                     }
                 } catch (RuntimeException e) {
-                    logStore.warn(SVC, traceId, "PAYMENT_ATTEMPT_FAILED",
-                        "Chaos: payment attempt=" + attempt + " failed: " + e.getMessage());
+                    logStore.warn(SVC, traceId, "PAYMENT_RETRY_FAILED",
+                        "gateway retry #" + attempt + " failed orderId=" + order.getId() + " — " + e.getMessage());
                 }
             }
         } catch (Exception e) {
-            logStore.error(SVC, traceId, "CHAOS_DUPLICATE_PAYMENT_ERROR",
-                "Chaos duplicate payment scenario threw: " + e.getMessage());
+            logStore.error(SVC, traceId, "PAYMENT_RETRY_WORKER_ERROR",
+                "payment retry worker: unrecoverable error — " + e.getMessage());
+        }
+        logStore.info(SVC, traceId, "payment retry worker: sweep complete");
+    }
+
+    // Cascade incident — inv timeout leads to payment success on unreserved order, deferred recon detects mismatch
+    @Scheduled(fixedDelay = 55000, initialDelay = 18000)
+    public void cascadeIncidentWorker() {
+        String traceId = "cascade-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "order pipeline: starting order fulfillment pipeline");
+
+        try {
+            List<Order.OrderItem> items = List.of(
+                new Order.OrderItem("PROD-004", 2, 49.99),
+                new Order.OrderItem("PROD-001", 1, 79.99)
+            );
+            Order order = orderService.createOrder("user-303", items, traceId);
+
+            // Cross-service terminology: BackgroundWorker uses "inventory phase unresolved"
+            logStore.warn(SVC, traceId, "INV_PHASE_INCOMPLETE",
+                "inventory phase unresolved — reservation for orderId=" + order.getId() + " did not complete");
+            logStore.info(SVC, traceId, "retrying reserve op attempt=1 orderId=" + order.getId());
+
+            try { Thread.sleep(200 + random.nextInt(300)); } catch (InterruptedException ignored) {}
+
+            logStore.warn(SVC, traceId, "INV_RESERVATION_INCOMPLETE",
+                "inv reservation incomplete — proceeding to payment phase orderId=" + order.getId());
+
+            try {
+                paymentService.processPayment(order.getId(), "user-303", 2 * 49.99 + 79.99, traceId);
+                logStore.info(SVC, traceId, "payment accepted orderId=" + order.getId());
+            } catch (RuntimeException e) {
+                logStore.warn(SVC, traceId, "PAYMENT_TIMEOUT",
+                    "gateway retry #2 orderId=" + order.getId() + " — " + e.getMessage());
+            }
+
+            final String orderId = order.getId();
+            final String reconTraceId = "RECON-" + UUID.randomUUID().toString().substring(0, 8);
+            new Thread(() -> {
+                try { Thread.sleep(4000 + random.nextInt(4000)); } catch (InterruptedException ignored) {}
+                // Observability blind spot: reconciliation detects a mismatch with no prior ERROR
+                logStore.warn(SVC, reconTraceId, "RECON_STATE_MISMATCH",
+                    "reconciliation detected order in inconsistent state orderId=" + orderId
+                    + " status=CREATED inventory_reserved=false payment_recorded=true");
+                logStore.info(SVC, reconTraceId, "db sync delayed — write queue depth=" + (1 + random.nextInt(4)));
+                logStore.warn(SVC, reconTraceId, "RECON_UNFULFILLED_RESERVATION",
+                    "unfulfilled reservation for orderId=" + orderId + " — stock commit not finalized");
+            }).start();
+
+        } catch (Exception e) {
+            logStore.error(SVC, traceId, "CASCADE_PIPELINE_ERROR",
+                "order pipeline: cascade error — " + e.getMessage());
         }
     }
 
+    // Observability blind spot — payment succeeds with no immediate error; anomaly visible only to reconciliation
+    @Scheduled(fixedDelay = 75000, initialDelay = 22000)
+    public void observabilityBlindSpotWorker() {
+        String traceId = "blind-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "payment settlement worker: processing outstanding settlement");
+
+        try {
+            List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-002", 1, 129.99));
+            Order order = orderService.createOrder("user-202", items, traceId);
+
+            // Payment proceeds — no inventory check logged at all (blind spot)
+            logStore.info(SVC, traceId, "settlement: routing payment for orderId=" + order.getId());
+            try {
+                paymentService.processPayment(order.getId(), "user-202", 129.99, traceId);
+                // Intentional: only INFO logged — no warning about missing inventory reservation
+                logStore.info(SVC, traceId, "settlement complete orderId=" + order.getId());
+            } catch (RuntimeException e) {
+                logStore.warn(SVC, traceId, "SETTLEMENT_GATEWAY_ERR",
+                    "settlement gateway rejected orderId=" + order.getId());
+            }
+
+            // Deferred reconciliation discovers anomaly 6-10 seconds later under different trace
+            final String orderId = order.getId();
+            final String auditTrace = "settle-audit-" + UUID.randomUUID().toString().substring(0, 6);
+            new Thread(() -> {
+                try { Thread.sleep(6000 + random.nextInt(4000)); } catch (InterruptedException ignored) {}
+                Order o = orderService.getOrder(orderId);
+                if (o != null && o.getStatus() != Order.Status.PAID) {
+                    // Anomaly: payment recorded but order not PAID — silent inconsistency now visible
+                    logStore.warn(SVC, auditTrace, "SETTLEMENT_AUDIT_MISMATCH",
+                        "settlement audit: payment record exists but order not in PAID state orderId=" + orderId);
+                    logStore.warn(SVC, auditTrace, "ORPHANED_PAYMENT_RECORD",
+                        "orphaned payment detected — no corresponding order state update orderId=" + orderId);
+                } else {
+                    logStore.info(SVC, auditTrace, "settlement audit: orderId=" + orderId + " state consistent");
+                }
+            }).start();
+
+        } catch (Exception e) {
+            logStore.error(SVC, traceId, "BLIND_SPOT_WORKER_ERROR",
+                "payment settlement worker: error — " + e.getMessage());
+        }
+    }
+
+    // Grey area incident — WARN flood that sometimes resolves, sometimes escalates
+    @Scheduled(fixedDelay = 80000, initialDelay = 35000)
+    public void greyAreaIncidentWorker() {
+        String traceId = "grey-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "platform health: starting degradation assessment");
+
+        String[] warnMessages = {
+            "response latency elevated — p99=" + (2100 + random.nextInt(900)) + "ms",
+            "thread pool saturation approaching — active=" + (6 + random.nextInt(2)) + "/8",
+            "db connection pool near capacity — " + (8 + random.nextInt(2)) + "/10 in use",
+            "retry queue growing — depth=" + (15 + random.nextInt(30)),
+            "metrics collector lag — buffer=" + (80 + random.nextInt(40)) + "ms"
+        };
+
+        // Emit 3–5 WARNs to look like real degradation
+        int warnCount = 3 + random.nextInt(3);
+        for (int i = 0; i < warnCount; i++) {
+            logStore.warn(SVC, traceId, "PLATFORM_DEGRADATION",
+                warnMessages[random.nextInt(warnMessages.length)]);
+            try { Thread.sleep(200 + random.nextInt(400)); } catch (InterruptedException ignored) {}
+        }
+
+        // 50% self-heal — no escalation (participants must decide if actionable)
+        if (random.nextDouble() < 0.5) {
+            logStore.info(SVC, traceId, "platform health: degradation resolved — metrics normalising");
+            logStore.info(SVC, traceId, "platform health: all thresholds within acceptable range");
+        } else {
+            // 50% escalate to ERROR after delay (creates WARN → ERROR pattern)
+            try { Thread.sleep(1500 + random.nextInt(1000)); } catch (InterruptedException ignored) {}
+            String[] escalateCodes = {"DOWNSTREAM_UNAVAILABLE", "PLATFORM_CIRCUIT_OPEN", "DEPENDENCY_FAILURE"};
+            String[] escalateMsgs = {
+                "downstream service unresponsive after repeated warnings — circuit open",
+                "platform degradation escalated — dependency not recovering",
+                "critical threshold crossed — service entering degraded mode"
+            };
+            int ep = random.nextInt(escalateCodes.length);
+            logStore.error(SVC, traceId, escalateCodes[ep], escalateMsgs[ep]);
+        }
+    }
+
+    // Audit reconciliation worker — scans stale CREATED orders
+    @Scheduled(fixedDelay = 70000, initialDelay = 25000)
+    public void auditReconciliationWorker() {
+        String traceId = "audit-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "order audit: scanning for stale CREATED orders");
+
+        Map<String, Order> allOrders = orderService.getAllOrders();
+        int staleCount = 0;
+        for (Map.Entry<String, Order> entry : allOrders.entrySet()) {
+            Order order = entry.getValue();
+            if (order.getStatus() == Order.Status.CREATED) {
+                staleCount++;
+                if (staleCount <= 3) {
+                    String[] staleMsgs = {
+                        "order audit: order in CREATED state past expected window orderId=" + order.getId(),
+                        "stale order detected \u2014 no state progression orderId=" + order.getId(),
+                        "audit: orderId=" + order.getId() + " remains uncommitted beyond SLA"
+                    };
+                    logStore.warn(SVC, traceId, "STALE_ORDER_DETECTED", staleMsgs[random.nextInt(staleMsgs.length)]);
+                }
+            }
+        }
+
+        if (staleCount > 0) {
+            String[] backlogMsgs = {
+                "order audit: " + staleCount + " orders remain in CREATED state — possible reservation backlog",
+                staleCount + " uncommitted orders detected — inv hold may not have applied",
+                "audit: stale order count=" + staleCount + " — reservation phase may be backlogged"
+            };
+            logStore.warn(SVC, traceId, "AUDIT_STALE_ORDERS", backlogMsgs[random.nextInt(backlogMsgs.length)]);
+        } else {
+            logStore.info(SVC, traceId, "order audit: no stale orders detected");
+        }
+        logStore.info(SVC, traceId, "order audit: scan complete orders_checked=" + allOrders.size());
+    }
+
+    // Session cleanup — evicts idle sessions and purges temp data
+    @Scheduled(fixedDelay = 65000, initialDelay = 30000)
+    public void sessionCleanupWorker() {
+        String traceId = "session-" + UUID.randomUUID().toString().substring(0, 8);
+        int cleaned = 3 + random.nextInt(12);
+        logStore.info(SVC, traceId, "session cleanup: evicting idle sessions count=" + cleaned);
+        if (random.nextDouble() < 0.25) {
+            logStore.warn(SVC, traceId, "SESSION_CLEANUP_SLOW",
+                "session cleanup took longer than expected — possible lock contention on session store");
+        }
+        logStore.info(SVC, traceId, "session cleanup: temp data purged entries=" + (10 + random.nextInt(40)));
+        logStore.info(SVC, traceId, "session cleanup: complete");
+    }
+
+    // Metrics collector — flushes telemetry and emits operational health logs (~70-80% noise)
     @Scheduled(fixedDelay = 35000, initialDelay = 3000)
-    public void emitNoiseLogs() {
-        String traceId = "noise-" + UUID.randomUUID().toString().substring(0, 8);
+    public void metricsCollectorWorker() {
+        String traceId = "metrics-" + UUID.randomUUID().toString().substring(0, 8);
+
         String[] noisy = {
-            "Scheduled task heartbeat — all systems nominal",
-            "Connection pool health check passed — 8/10 connections active",
-            "Cache eviction triggered — 142 entries removed",
-            "Metrics flush complete — sent 38 data points to collector",
-            "Token refresh cycle complete — next refresh in 3600s",
-            "Background audit complete — 0 anomalies detected"
+            "heartbeat ok — all downstream dependencies reachable",
+            "conn pool health: " + (6 + random.nextInt(4)) + "/10 connections active",
+            "cache eviction: " + (80 + random.nextInt(120)) + " entries removed lru_threshold=512",
+            "metrics flush: " + (28 + random.nextInt(20)) + " data points dispatched to collector",
+            "token refresh: access token renewed ttl=3600s",
+            "audit trail: " + (5 + random.nextInt(15)) + " events persisted to audit log",
+            "gc: minor collection pause_ms=" + (10 + random.nextInt(40)) + " heap_freed=" + (20 + random.nextInt(80)) + "mb",
+            "db pool: idle connections reclaimed count=" + (1 + random.nextInt(3)),
+            "rate limiter: ok req_count=" + random.nextInt(80) + "/100 window=60s",
+            "scheduler heartbeat — workers_active=" + (6 + random.nextInt(3)),
+            "feature flag poll: no config changes detected version=stable",
+            "health probe: inventory svc responded in " + (20 + random.nextInt(80)) + "ms",
+            "health probe: payment gateway responded in " + (50 + random.nextInt(200)) + "ms",
+            "index sync: search index refreshed documents=" + (100 + random.nextInt(900)),
+            "cache warm: preloaded " + (5 + random.nextInt(20)) + " product records",
+            "shard rebalance: no rebalance needed partition_count=8",
+            "queue compaction: dead letters pruned count=" + (2 + random.nextInt(10)),
+            "cron: " + (random.nextInt(50) + 10) + " scheduled tasks completed this cycle",
+            "session store: " + (random.nextInt(200) + 50) + " active sessions tracked",
+            "telemetry: uptime=" + (random.nextInt(3600) + 100) + "s since last restart"
         };
-        String[] warnings = {
-            "Response time spike detected — p99=2340ms (threshold=2000ms)",
-            "Thread pool utilization high — 7/8 threads busy",
-            "Slow query detected — took 890ms on orders table",
-            "Memory usage at 78% — GC pressure increasing"
+
+        String[] perfWarnings = {
+            "response time degradation — p99=" + (2100 + random.nextInt(800)) + "ms threshold=2000ms",
+            "thread pool utilization elevated — " + (6 + random.nextInt(2)) + "/8 threads busy",
+            "slow query on orders table — duration=" + (700 + random.nextInt(600)) + "ms",
+            "memory pressure: heap=" + (70 + random.nextInt(20)) + "% — GC pressure increasing",
+            "connection pool near capacity — " + (8 + random.nextInt(2)) + "/10 in use",
+            "upstream latency spike — avg_rtt=" + (180 + random.nextInt(200)) + "ms",
+            "metrics collector lag — buffer_depth=" + (random.nextInt(50) + 20) + "ms",
+            "feature flag poll timeout — using cached config age=" + (random.nextInt(300) + 60) + "s",
+            "cache refresh delay — stale entries may be served for " + (random.nextInt(30) + 5) + "s"
         };
-        for (int i = 0; i < 2 + random.nextInt(3); i++) {
+
+        // 70-80% noise: emit 5-9 info logs
+        int noiseCount = 5 + random.nextInt(5);
+        for (int i = 0; i < noiseCount; i++) {
             logStore.info(SVC, traceId, noisy[random.nextInt(noisy.length)]);
         }
-        if (random.nextDouble() < 0.4) {
-            logStore.warn(SVC, traceId, "PERFORMANCE_DEGRADATION",
-                warnings[random.nextInt(warnings.length)]);
+
+        // ~35% chance of WARN flood — may or may not precede real error
+        if (random.nextDouble() < 0.35) {
+            int warnCount = 2 + random.nextInt(3);
+            for (int i = 0; i < warnCount; i++) {
+                logStore.warn(SVC, traceId, "PERFORMANCE_DEGRADATION",
+                    perfWarnings[random.nextInt(perfWarnings.length)]);
+            }
+            // ~35% of WARN floods escalate to real downstream error
+            if (random.nextDouble() < 0.35) {
+                try { Thread.sleep(1500 + random.nextInt(1000)); } catch (InterruptedException ignored) {}
+                logStore.error(SVC, traceId, "DOWNSTREAM_UNAVAILABLE",
+                    "downstream service unresponsive after repeated timeouts — circuit open");
+            }
         }
     }
 }
