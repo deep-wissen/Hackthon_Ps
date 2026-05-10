@@ -197,6 +197,16 @@ public class PaymentService {
 
     @Async("taskExecutor")
     public CompletableFuture<Void> schedulePaymentConfirmation(String paymentId, String orderId, String callerTraceId) {
+        // FIX INC-20260509181021-C7D42E: Restore caller's full MDC context into this async
+        // thread. MDC is thread-local; without explicit propagation every key (trace_id,
+        // service, order_id) is lost when Spring hands the task to the executor thread pool,
+        // producing orphaned traces and CONFIRM_NOTIFICATION_FAILED errors.
+        Map<String, String> propagatedMdc = new HashMap<>();
+        if (callerTraceId != null) propagatedMdc.put(TraceContext.TRACE_ID_KEY, callerTraceId);
+        propagatedMdc.put(TraceContext.SERVICE_KEY, SVC);
+        if (orderId != null)     propagatedMdc.put(TraceContext.ORDER_ID_KEY, orderId);
+        MDC.setContextMap(propagatedMdc); // restore full trace context on this async thread
+
         try {
             Thread.sleep(1000 + new Random().nextInt(2000));
         } catch (InterruptedException ignored) {}
@@ -204,7 +214,8 @@ public class PaymentService {
         Payment p = paymentsById.get(paymentId);
         if (p == null) {
             log.error("Async confirmation: payment not found paymentId={}", paymentId);
-            logStore.error(SVC, "ASYNC-ORPHAN", "CONFIRM_PAYMENT_NOT_FOUND",
+            // Use callerTraceId (not "ASYNC-ORPHAN") so the error is linked to the originating trace
+            logStore.error(SVC, callerTraceId, "CONFIRM_PAYMENT_NOT_FOUND",
                     "Async job could not find payment record paymentId=" + paymentId);
             return CompletableFuture.completedFuture(null);
         }
@@ -219,13 +230,16 @@ public class PaymentService {
             };
             int cf = rng.nextInt(cfailCodes.length);
             log.warn("Async payment confirmation failed — notification not sent paymentId={}", paymentId);
-            logStore.skewWarn(SVC, "ASYNC-ORPHAN", cfailCodes[cf], cfailMsgs[cf]);
+            // Use callerTraceId so warn is correlated to the originating payment trace
+            logStore.skewWarn(SVC, callerTraceId, cfailCodes[cf], cfailMsgs[cf]);
         } else {
             log.info("Async confirmation sent paymentId={}", paymentId);
-            logStore.skewInfo(SVC, "ASYNC-" + callerTraceId,
+            // Use callerTraceId directly (previously was "ASYNC-" + callerTraceId, breaking trace linkage)
+            logStore.skewInfo(SVC, callerTraceId,
                     "Payment confirmation dispatched for paymentId=" + paymentId);
         }
 
+        MDC.clear(); // clean up MDC to avoid context leaking to the next task on this thread
         return CompletableFuture.completedFuture(null);
     }
 
