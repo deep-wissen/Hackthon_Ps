@@ -67,6 +67,19 @@ public class InventoryService {
 
     /**
      * Reserve stock for an order.
+     *
+     * FIX (INC-20260510034621-2F25DE): The original implementation read stock into a local
+     * variable, slept 10 ms, then wrote back — a textbook check-then-act race condition that
+     * allowed concurrent threads to both pass the stock check with the same stale snapshot,
+     * causing reservedStock to exceed actual available stock and triggering HIGH_RESERVATION_RATIO.
+     *
+     * The fix replaces the racy read/sleep/write with:
+     *   1. A CAS (compareAndSet) spin loop on the AtomicInteger so the stock decrement is
+     *      atomic with respect to every other thread — if another thread changed stock between
+     *      our read and our write, CAS fails and we re-read the current value and retry.
+     *   2. A synchronized block on the InventoryItem instance that brackets BOTH the CAS
+     *      result commit AND the reservedStock increment, ensuring the two fields are always
+     *      updated together as one consistent unit, eliminating the ratio imbalance.
      */
     public boolean reserveStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -98,30 +111,52 @@ public class InventoryService {
             throw new RuntimeException("Inventory store transient failure");
         }
 
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+        // FIX: Synchronize on the item so that the CAS loop and the reservedStock update
+        //      are treated as a single atomic section — no other thread can interleave
+        //      between the stock decrement and the reservedStock increment.
+        synchronized (item) {
+            int current = item.getStockRef().get(); // read inside the lock for a consistent view
+            log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
 
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
-        }
+            if (current < quantity) {
+                String[] msgs = {
+                    "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
+                    "stock check fail: have=" + current + " need=" + quantity,
+                    "cannot reserve — stock level below threshold for " + productId
+                };
+                log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+                return false;
+            }
 
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+            // FIX: CAS loop — atomically decrement stock only when the value has not changed
+            //      since we last read it; retries if a concurrent update beat us to it.
+            boolean decremented = false;
+            int snapshot = current;
+            while (!decremented) {
+                snapshot = item.getStockRef().get();
+                if (snapshot < quantity) {
+                    // Another concurrent reservation consumed stock since our initial check
+                    log.warn("Concurrent reservation depleted stock productId={} snapshot={} requested={}", productId, snapshot, quantity);
+                    logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK",
+                            "concurrent reservation reduced stock below required level for " + productId);
+                    return false;
+                }
+                // Atomically swap snapshot → (snapshot - quantity); retries if snapshot changed
+                decremented = item.getStockRef().compareAndSet(snapshot, snapshot - quantity);
+            }
 
-        item.setStock(current - quantity);
-        item.setReservedStock(item.getReservedStock() + quantity);
-        item.setLastUpdated(Instant.now());
+            // FIX: Both fields updated inside the same synchronized block — reservation ratio
+            //      is always consistent between stock and reservedStock after this point.
+            item.setReservedStock(item.getReservedStock() + quantity);
+            item.setLastUpdated(Instant.now());
+        } // end synchronized — lock released; both fields are now visible to other threads
 
-        log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
+        int remaining = item.getStock(); // safe to read outside lock for logging only
+        log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, remaining);
         if (rng.nextInt(10) < 8) {
             logStore.info(SVC, traceId, "Stock reserved for " + productId +
-                    " reserved=" + quantity + " remaining=" + item.getStock());
+                    " reserved=" + quantity + " remaining=" + remaining);
         } else {
             logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
         }
