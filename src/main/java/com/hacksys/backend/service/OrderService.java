@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * OrderService — manages order lifecycle including creation, reservation, payment and cancellation.
@@ -31,6 +32,12 @@ public class OrderService {
     private double failureRate;
 
     private final ConcurrentHashMap<String, Order> orders = new ConcurrentHashMap<>();
+
+    // FIX (INC-20260510054703-935B33): idempotency registry — maps a stable submission key
+    // (userId + item fingerprint) to an already-accepted Order, preventing duplicate processing
+    // on retries that would otherwise create orphaned orders with null userIds downstream.
+    private final ConcurrentHashMap<String, Order> idempotencyRegistry = new ConcurrentHashMap<>();
+
     private static final Random rng = new Random();
 
     // Setter injection to break circular dependency with PaymentService
@@ -40,6 +47,19 @@ public class OrderService {
 
     public OrderService(LogStore logStore) {
         this.logStore = logStore;
+    }
+
+    // ---------------------------------------------------------------------------
+    // FIX (INC-20260510054703-935B33): builds a deterministic, order-independent
+    // key from the userId and the sorted set of productId:qty pairs so that any
+    // retry of the exact same logical order maps to the same registry slot.
+    // ---------------------------------------------------------------------------
+    private String buildSubmissionKey(String userId, List<Order.OrderItem> items) {
+        String itemFingerprint = items.stream()
+                .map(i -> i.getProductId() + ":" + i.getQuantity())
+                .sorted()
+                .collect(Collectors.joining("|"));
+        return userId + "#" + itemFingerprint;
     }
 
     /**
@@ -53,17 +73,38 @@ public class OrderService {
         log.info("Order creation requested userId={} itemCount={}", userId, items != null ? items.size() : 0);
         logStore.info(SVC, traceId, "New order request from userId=" + userId +
                 " items=" + (items != null ? items.size() : "null"));
+
+        // FIX (INC-20260510054703-935B33): Guard must come FIRST — reject null/blank userId
+        // immediately so the order is never persisted without a user association.
+        // Previously this block only logged a warning and silently continued, letting
+        // a null userId propagate to the BackgroundWorker and trigger NULL_USER_ID errors.
+        if (userId == null || userId.isBlank()) {
+            log.error("Order rejected — null or blank userId provided");
+            logStore.error(SVC, traceId, "NULL_USER_ID",
+                    "Order submission rejected: userId must not be null or blank");
+            throw new IllegalArgumentException("userId must not be null or blank");
+        }
+
         if (items == null || items.isEmpty()) {
             log.error("Order rejected — no items provided userId={}", userId);
             logStore.error(SVC, traceId, "EMPTY_ORDER", "Order rejected: no items for userId=" + userId);
             throw new IllegalArgumentException("Order must contain at least one item");
         }
 
-        if (userId == null) {
-            log.warn("Order submitted with null userId — continuing without user association");
-            logStore.warn(SVC, traceId, "NULL_USER_ID",
-                    "Order submitted without user context — downstream association unavailable");
+        // FIX (INC-20260510054703-935B33): idempotency check — if an identical submission
+        // (same userId + same item set) was already accepted, return the existing Order
+        // instead of creating a duplicate. This makes submitOrder safe for at-least-once
+        // delivery retry patterns used by the BackgroundWorker.
+        String submissionKey = buildSubmissionKey(userId, items);
+        Order existingOrder = idempotencyRegistry.get(submissionKey);
+        if (existingOrder != null) {
+            log.info("Duplicate submission detected — returning existing order orderId={} userId={}",
+                    existingOrder.getId(), userId);
+            logStore.info(SVC, traceId, "Idempotent submission resolved to existing orderId="
+                    + existingOrder.getId() + " for userId=" + userId);
+            return existingOrder;
         }
+
         log.info("Item validation passed — {} items in order", items.size());
 
         String orderId = UUID.randomUUID().toString();
@@ -71,6 +112,10 @@ public class OrderService {
         order.setStatus(Order.Status.CREATED);
 
         orders.put(orderId, order);
+
+        // Register in idempotency map so subsequent retries resolve to this order
+        idempotencyRegistry.put(submissionKey, order);
+
         TraceContext.setOrderId(orderId);
 
         log.info("Order persisted orderId={} status=CREATED", orderId);
